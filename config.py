@@ -25,6 +25,11 @@ class Config:
     n_jobs: Optional[int] = None  # None means use all available cores
     chunk_size: Optional[int] = None  # None means auto-determine
 
+    # Streaming Processing
+    use_streaming: bool = True  # Process data in chunks to reduce memory usage
+    streaming_chunk_size: int = 10  # Number of slices to process at once
+    max_memory_usage_gb: float = 4.0  # Maximum memory usage in GB
+
     # Denoising
     denoise_method: Optional[str] = field(
         default=None, metadata={"choices": ["gaussian", "nlm", "tv"]}
@@ -33,6 +38,16 @@ class Config:
 
     # Segmentation
     pore_threshold: float = 0.2
+    segmentation_params: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "use_adaptive_threshold": False,
+            "adaptive_block_size": 99,
+            "min_bone_size": 100,
+            "min_pore_size": 20,
+            "pore_threshold": 0.2,
+        }
+    )
+    adaptive_segmentation: bool = True  # Use adaptive parameter selection
 
     # Material Properties
     material_model: str = field(
@@ -58,6 +73,10 @@ class Config:
     save_visualization: bool = True
     visualization_dpi: int = 300
 
+    # Error Recovery
+    enable_checkpoints: bool = True  # Enable checkpoint/resume functionality
+    checkpoint_frequency: int = 1  # Save checkpoint after each stage
+
     @classmethod
     def from_gui(cls):
         """Create Config instance from GUI inputs"""
@@ -75,3 +94,9 @@ class Config:
             raise ValueError(f"Invalid coarsen factor: {self.coarsen_factor}")
         if not 0 <= self.pore_threshold <= 1:
             raise ValueError(f"Invalid pore threshold: {self.pore_threshold}")
+        if self.streaming_chunk_size < 1:
+            raise ValueError(
+                f"Invalid streaming chunk size: {self.streaming_chunk_size}"
+            )
+        if self.max_memory_usage_gb <= 0:
+            raise ValueError(f"Invalid max memory usage: {self.max_memory_usage_gb}")
