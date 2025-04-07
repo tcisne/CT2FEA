@@ -3,7 +3,7 @@ from pathlib import Path
 import logging
 import time
 import numpy as np
-from typing import Dict, Any, Optional, List, Iterator
+from typing import Dict, Any, Optional, Tuple
 import pyvista as pv
 from tqdm import tqdm
 
@@ -24,363 +24,312 @@ from .processing import (
 )
 from .meshing import create_voxel_mesh, export_to_abaqus
 from .materials import get_material_mapper
-from .utils.logging import setup_logging, PipelineLogger
-from .utils import visualization
 from .utils.validation import (
-    validate_ct_data,
+    validate_output_path,
     validate_mesh,
     validate_material_properties,
-    validate_output_path,
 )
-from .utils.profiling import (
-    PerformanceMonitor,
-    profile_stage,
-    check_memory_available,
-    estimate_memory_usage,
+
+# Set up basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-from .utils.errors import CT2FEAError, RecoverableError
-from .utils.validation import ValidationMetrics
+logger = logging.getLogger(__name__)
 
 
-class Pipeline:
-    """Main CT2FEA processing pipeline with performance monitoring and error recovery"""
+def process_ct_data(
+    input_folder: str, output_dir: str, config: Config
+) -> Dict[str, Any]:
+    """Process CT data from TIFF files
 
-    def __init__(self, config: Config, resume_from_checkpoint: bool = False):
-        """Initialize pipeline with configuration
+    Args:
+        input_folder: Path to folder containing TIFF files
+        output_dir: Path to output directory
+        config: Configuration object
 
-        Args:
-            config: Configuration object
-            resume_from_checkpoint: Whether to attempt resuming from checkpoint
-        """
-        self.config = config
-        self.stats: Dict[str, Any] = {}
-        self.resume_from_checkpoint = resume_from_checkpoint
-        self._setup()
+    Returns:
+        Dictionary with processing results and metadata
+    """
+    logger.info("Starting CT data processing")
+    start_time = time.time()
 
-        # Initialize visualization if enabled
-        self.interactive_vis = None
-        if config.visualization_dpi > 0:  # Only create if visualization is enabled
-            from .utils.interactive_vis import InteractivePlotter
+    # Create output directory if it doesn't exist
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-            self.interactive_vis = InteractivePlotter(config)
+    # Get metadata about CT stack
+    input_path = Path(input_folder)
+    metadata = get_ct_metadata(input_path)
+    logger.info(
+        f"CT stack contains {metadata['n_slices']} slices, "
+        f"dimensions: {metadata['height']}x{metadata['width']}, "
+        f"estimated size: {metadata['total_size_mb']:.1f}MB"
+    )
 
-    def _setup(self) -> None:
-        """Set up logging, profiling, checkpoint management and output directory"""
-        self.output_dir = Path(self.config.output_dir)
-        validate_output_path(self.output_dir)
+    # Process CT data in chunks
+    tiff_files = sorted(input_path.glob("*.tif*"))
 
-        setup_logging(self.output_dir)
-        self.logger = PipelineLogger(__name__)
+    # Calculate global percentiles for normalization
+    logger.info("Calculating global intensity statistics")
+    min_vals = []
+    max_vals = []
 
-        # Initialize performance monitoring
-        self.monitor = PerformanceMonitor(self.output_dir)
+    # Process in chunks to find global min/max
+    for chunk in create_ct_iterator(tiff_files, config.chunk_size):
+        min_vals.append(np.percentile(chunk, config.clip_percentiles[0]))
+        max_vals.append(np.percentile(chunk, config.clip_percentiles[1]))
 
-        # Initialize validation metrics
-        self.validation = ValidationMetrics(self.output_dir)
+    # Calculate global percentiles
+    global_min = np.min(min_vals)
+    global_max = np.max(max_vals)
 
-        # Initialize checkpoint manager for error recovery
-        from .utils.errors import CheckpointManager
+    logger.info(f"Global intensity range: [{global_min:.1f}, {global_max:.1f}]")
 
-        self.checkpoint_manager = CheckpointManager(self.output_dir)
+    # Process chunks and save directly
+    logger.info("Processing CT data in chunks")
 
-        # Set up streaming parameters
-        self.chunk_size = self.config.chunk_size or 10  # Default to 10 slices per chunk
+    # Create a generator for processed chunks
+    def process_chunks():
+        for i, chunk in enumerate(create_ct_iterator(tiff_files, config.chunk_size)):
+            logger.info(f"Processing chunk {i + 1}")
 
-    def run(self) -> None:
-        """Run the complete pipeline with performance monitoring and error recovery"""
-        try:
-            self.monitor.start_profiling()
-            start_time = time.time()
-
-            self.logger.info("Starting CT2FEA Pipeline")
-            self.config.validate()
-
-            # Check for existing checkpoint if resuming
-            checkpoint_data = None
-            if self.resume_from_checkpoint:
-                checkpoint_data = self.checkpoint_manager.load_checkpoint()
-                if checkpoint_data:
-                    self.logger.info(
-                        f"Resuming from checkpoint at stage: {checkpoint_data['stage']}"
-                    )
-                else:
-                    self.logger.info("No checkpoint found, starting from beginning")
-
-            # Process CT data with streaming approach
-            ct_metadata = self._get_ct_metadata()
-            self.stats.update(ct_metadata)
-
-            # Process CT data in chunks
-            if not checkpoint_data or checkpoint_data["stage"] == "init":
-                self._process_ct_streaming()
-                self.checkpoint_manager.save_checkpoint(
-                    "ct_processing", {"completed": True}
-                )
-
-            # Check memory for mesh generation
-            volume_shape = (
-                ct_metadata["n_slices"],
-                ct_metadata["height"],
-                ct_metadata["width"],
+            # Normalize chunk
+            chunk_norm = ((chunk - global_min) / (global_max - global_min)).astype(
+                np.float32
             )
-            mesh_memory = self._estimate_mesh_memory(volume_shape)
-            if not check_memory_available(mesh_memory):
-                # Create recoverable error with checkpoint data
-                from .utils.errors import RecoverableError
+            chunk_norm = np.clip(chunk_norm, 0, 1)
 
-                raise RecoverableError(
-                    "Insufficient memory for mesh generation",
-                    f"Required: {mesh_memory:.1f}MB",
-                    context={"volume_shape": volume_shape},
-                    checkpoint_data={"stage": "ct_processing", "completed": True},
-                )
+            # Optional coarsening
+            if config.coarsen_factor > 1:
+                chunk_norm = coarsen_volume(chunk_norm, config.coarsen_factor)
 
-            # Generate mesh
-            if not checkpoint_data or checkpoint_data["stage"] in (
-                "init",
-                "ct_processing",
-            ):
-                mesh = self._generate_mesh()
-                self.checkpoint_manager.save_checkpoint(
-                    "mesh_generation", {"completed": True}
-                )
+            # Denoising if enabled
+            if config.denoise_method:
+                chunk_norm = denoise_volume(chunk_norm, config.denoise_method, config)
 
-            # Calculate material properties
-            if not checkpoint_data or checkpoint_data["stage"] in (
-                "init",
-                "ct_processing",
-                "mesh_generation",
-            ):
-                materials = self._assign_materials(mesh)
-                self.checkpoint_manager.save_checkpoint(
-                    "material_assignment", {"completed": True}
-                )
+            # Save visualization of first chunk
+            if i == 0 and config.save_visualization:
+                from .visualization import visualize_slice
 
-            # Export results
-            if not checkpoint_data or checkpoint_data["stage"] in (
-                "init",
-                "ct_processing",
-                "mesh_generation",
-                "material_assignment",
-            ):
-                self._export_results(mesh, materials)
-                self.checkpoint_manager.save_checkpoint("export", {"completed": True})
+                visualize_slice(chunk_norm, output_path, name="ct_slice_sample")
 
-            # Generate reports
-            self._generate_reports()
+            yield chunk_norm
 
-            elapsed_time = time.time() - start_time
-            self.logger.info(f"Pipeline completed in {elapsed_time:.1f} seconds")
+    # Save processed chunks
+    processed_path = save_ct_chunks(output_path, process_chunks(), config)
 
-            # Stop profiling and generate performance report
-            self.monitor.stop_profiling()
-            self.monitor.generate_report()
+    elapsed_time = time.time() - start_time
+    logger.info(f"CT processing completed in {elapsed_time:.1f} seconds")
 
-            # Clear checkpoint after successful completion
-            self.checkpoint_manager.clear_checkpoint()
+    return {
+        "metadata": metadata,
+        "processed_path": processed_path,
+        "normalization": {
+            "min": float(global_min),
+            "max": float(global_max),
+        },
+    }
 
-        except RecoverableError as e:
-            self.logger.error(f"Pipeline failed with recoverable error: {str(e)}")
-            # Save checkpoint for later resumption
-            e.save_checkpoint(self.output_dir)
-            raise
 
-        except Exception as e:
-            self.logger.error(f"Pipeline failed: {str(e)}")
-            # Create emergency checkpoint with current state
-            context = {
-                "error": str(e),
-                "stage": self.stats.get("current_stage", "unknown"),
-            }
-            self.checkpoint_manager.save_checkpoint("error", context)
-            raise
+def segment_ct_data(
+    ct_data: np.ndarray, output_dir: str, config: Config
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Segment CT data into bone and pore regions
 
-    @profile_stage()
-    def _get_ct_metadata(self) -> Dict[str, Any]:
-        """Get CT metadata without loading full volume"""
-        self.logger.start_stage("CT Metadata Analysis")
-        self.stats["current_stage"] = "ct_metadata"
+    Args:
+        ct_data: Processed CT data as numpy array
+        output_dir: Path to output directory
+        config: Configuration object
 
-        # Get metadata about CT stack
-        metadata = get_ct_metadata(Path(self.config.input_folder))
-        self.logger.info(
-            f"CT stack contains {metadata['n_slices']} slices, "
-            f"dimensions: {metadata['height']}x{metadata['width']}, "
-            f"estimated size: {metadata['total_size_mb']:.1f}MB"
-        )
+    Returns:
+        Tuple of (bone_mask, pore_mask)
+    """
+    logger.info("Starting CT segmentation")
+    start_time = time.time()
 
-        # Generate validation reports
-        self.validation.save_metrics()
-        self.validation.generate_report()
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-        self.logger.end_stage()
-        return metadata
+    # Perform segmentation
+    bone_mask, pore_mask = segment_volume(ct_data, config)
 
-    @profile_stage()
-    def _process_ct_streaming(self) -> None:
-        """Process CT volume data in chunks to reduce memory usage"""
-        self.logger.start_stage("CT Processing (Streaming)")
-        self.stats["current_stage"] = "ct_processing"
+    # Validate segmentation
+    validation_metrics = validate_segmentation(bone_mask, pore_mask)
+    logger.info(
+        f"Segmentation complete - Bone fraction: {validation_metrics['bone_fraction']:.3f}, "
+        f"Pore fraction: {validation_metrics['pore_fraction']:.3f}"
+    )
 
-        input_folder = Path(self.config.input_folder)
-        tiff_files = sorted(input_folder.glob("*.tif*"))
+    # Save visualization if enabled
+    if config.save_visualization:
+        from .visualization import visualize_segmentation
 
-        # Calculate global percentiles for normalization
-        # This requires a first pass through the data
-        self.logger.info("Calculating global intensity statistics")
-        min_vals = []
-        max_vals = []
+        visualize_segmentation(ct_data, bone_mask, pore_mask, output_path)
 
-        # Process in chunks to find global min/max
-        for chunk in create_ct_iterator(tiff_files, self.chunk_size):
-            min_vals.append(np.percentile(chunk, self.config.clip_percentiles[0]))
-            max_vals.append(np.percentile(chunk, self.config.clip_percentiles[1]))
+    elapsed_time = time.time() - start_time
+    logger.info(f"Segmentation completed in {elapsed_time:.1f} seconds")
 
-        # Calculate global percentiles
-        global_min = np.min(min_vals)
-        global_max = np.max(max_vals)
-        self.stats["normalization"] = {
-            "clip_min": float(global_min),
-            "clip_max": float(global_max),
-        }
+    return bone_mask, pore_mask
 
-        self.logger.info(
-            f"Global intensity range: [{global_min:.1f}, {global_max:.1f}]"
-        )
 
-        # Process chunks and save directly
-        self.logger.info("Processing CT data in chunks")
+def generate_mesh(
+    bone_mask: np.ndarray, pore_mask: np.ndarray, output_dir: str, config: Config
+) -> Tuple[pv.UnstructuredGrid, Dict]:
+    """Generate mesh from segmentation masks
 
-        # Create a generator for processed chunks
-        def process_chunks():
-            for i, chunk in enumerate(create_ct_iterator(tiff_files, self.chunk_size)):
-                self.logger.info(f"Processing chunk {i + 1}")
+    Args:
+        bone_mask: Binary mask of bone regions
+        pore_mask: Binary mask of pore regions
+        output_dir: Path to output directory
+        config: Configuration object
 
-                # Normalize chunk
-                chunk_norm = ((chunk - global_min) / (global_max - global_min)).astype(
-                    np.float32
-                )
-                chunk_norm = np.clip(chunk_norm, 0, 1)
+    Returns:
+        Tuple of (mesh, material_info)
+    """
+    logger.info("Starting mesh generation")
+    start_time = time.time()
 
-                # Optional coarsening
-                if self.config.coarsen_factor > 1:
-                    chunk_norm = coarsen_volume(chunk_norm, self.config.coarsen_factor)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-                # Denoising if enabled
-                if self.config.denoise_method:
-                    chunk_norm = denoise_volume(
-                        chunk_norm, self.config.denoise_method, self.config
-                    )
+    # Create mesh
+    mesh, material_info = create_voxel_mesh(bone_mask, pore_mask, config)
 
-                # Visualize first chunk
-                if i == 0 and self.config.save_visualization:
-                    visualization.visualize_slice(
-                        chunk_norm,
-                        self.output_dir,
-                        self.config,
-                        name=f"chunk_{i}_processed",
-                    )
+    # Validate mesh
+    validate_mesh(mesh)
 
-                yield chunk_norm
+    logger.info(
+        f"Generated mesh with {mesh.n_cells} elements and {mesh.n_points} nodes"
+    )
+    logger.info(f"Material distribution: {material_info}")
 
-        # Save processed chunks
-        save_ct_chunks(self.output_dir, process_chunks(), self.config)
+    # Save visualization if enabled
+    if config.save_visualization:
+        from .visualization import visualize_mesh
 
-        self.logger.end_stage()
+        visualize_mesh(mesh, output_path)
 
-    @profile_stage()
-    def _generate_mesh(self) -> pv.UnstructuredGrid:
-        """Generate and validate mesh with performance monitoring"""
-        self.logger.start_stage("Mesh Generation")
+    elapsed_time = time.time() - start_time
+    logger.info(f"Mesh generation completed in {elapsed_time:.1f} seconds")
 
-        # Segmentation with parallel processing
-        bone_mask, pore_mask = segment_volume(self.stats["ct_processed"], self.config)
-        validate_segmentation(bone_mask, pore_mask)
+    return mesh, material_info
 
-        # Create mesh
-        mesh, material_info = create_voxel_mesh(bone_mask, pore_mask, self.config)
-        self.stats["mesh_info"] = material_info
 
-        # Validate mesh quality
-        validate_mesh(mesh)
+def assign_materials(
+    ct_data: np.ndarray, mesh: pv.UnstructuredGrid, output_dir: str, config: Config
+) -> Dict:
+    """Assign material properties to mesh
 
-        # Interactive mesh visualization if enabled
-        if self.interactive_vis:
-            self.interactive_vis.visualize_mesh(mesh)
+    Args:
+        ct_data: Processed CT data
+        mesh: PyVista mesh
+        output_dir: Path to output directory
+        config: Configuration object
 
-        self.logger.end_stage(extra_data=material_info)
-        return mesh
+    Returns:
+        Dictionary with material properties
+    """
+    logger.info("Starting material property assignment")
+    start_time = time.time()
 
-    @profile_stage()
-    def _assign_materials(self, mesh: pv.UnstructuredGrid) -> Dict:
-        """Calculate material properties with performance monitoring"""
-        self.logger.start_stage("Material Assignment")
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-        mapper = get_material_mapper(self.config)
-        materials = mapper.calculate_properties(self.stats["ct_processed"])
+    # Calculate material properties
+    mapper = get_material_mapper(config)
+    materials = mapper.calculate_properties(ct_data)
 
-        # Validate properties
-        validate_material_properties(materials, self.config.material_model)
+    # Validate properties
+    validate_material_properties(materials, config.material_model)
 
-        # Interactive material visualization if enabled
-        if self.interactive_vis:
-            self.interactive_vis.visualize_material_distribution(mesh, materials)
+    # Save visualization if enabled
+    if config.save_visualization:
+        from .visualization import visualize_materials
 
-        self.logger.end_stage()
-        return materials
+        visualize_materials(mesh, materials, output_path)
 
-    @profile_stage()
-    def _export_results(self, mesh: pv.UnstructuredGrid, materials: Dict) -> None:
-        """Export results with performance monitoring"""
-        self.logger.start_stage("Export")
+    elapsed_time = time.time() - start_time
+    logger.info(f"Material assignment completed in {elapsed_time:.1f} seconds")
 
-        # Save processed CT data
-        save_processed_ct(self.output_dir, self.stats["ct_processed"], self.config)
+    return materials
 
-        # Export Abaqus input file
-        output_path = self.output_dir / "model.inp"
-        export_to_abaqus(mesh, materials, self.config, output_path)
 
-        self.logger.end_stage()
+def export_model(
+    mesh: pv.UnstructuredGrid, materials: Dict, output_dir: str, config: Config
+) -> str:
+    """Export mesh and materials to FEA format
 
-    def _generate_reports(self) -> None:
-        """Generate quality and performance reports"""
-        self.logger.start_stage("Report Generation")
+    Args:
+        mesh: PyVista mesh
+        materials: Material properties
+        output_dir: Path to output directory
+        config: Configuration object
 
-        visualization.create_quality_plots(
-            self.stats["quality_metrics"],
-            self.stats["mesh_info"],
-            self.output_dir,
-            self.config,
-        )
+    Returns:
+        Path to exported file
+    """
+    logger.info("Starting model export")
+    start_time = time.time()
 
-        self.logger.end_stage()
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    def _estimate_mesh_memory(self, volume_shape: tuple) -> float:
-        """Estimate memory requirements for mesh generation
+    # Export to Abaqus format
+    output_file = output_path / "model.inp"
+    export_to_abaqus(mesh, materials, config, output_file)
 
-        Args:
-            volume_shape: Shape of CT volume
+    elapsed_time = time.time() - start_time
+    logger.info(f"Model export completed in {elapsed_time:.1f} seconds")
 
-        Returns:
-            Estimated memory requirement in MB
-        """
-        # Estimate number of elements (worst case)
-        max_elements = np.prod(volume_shape)
+    return str(output_file)
 
-        # Memory for node coordinates (float64)
-        node_memory = estimate_memory_usage((max_elements * 8, 3), np.float64)
 
-        # Memory for connectivity (int32)
-        connect_memory = estimate_memory_usage((max_elements, 8), np.int32)
+def run_pipeline(config: Config) -> Dict[str, Any]:
+    """Run the complete CT2FEA pipeline
 
-        # Memory for material properties (float32)
-        material_memory = estimate_memory_usage((max_elements, 3), np.float32)
+    Args:
+        config: Configuration object
 
-        # Add 20% overhead for other data structures
-        total_memory = (node_memory + connect_memory + material_memory) * 1.2
+    Returns:
+        Dictionary with results
+    """
+    logger.info("Starting CT2FEA pipeline")
+    start_time = time.time()
 
-        return total_memory
+    # Validate configuration
+    config.validate()
+
+    # Create output directory
+    output_path = Path(config.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Process CT data
+    ct_results = process_ct_data(config.input_folder, config.output_dir, config)
+
+    # Load processed CT data
+    ct_data = np.load(ct_results["processed_path"])
+
+    # Segment CT data
+    bone_mask, pore_mask = segment_ct_data(ct_data, config.output_dir, config)
+
+    # Generate mesh
+    mesh, material_info = generate_mesh(bone_mask, pore_mask, config.output_dir, config)
+
+    # Assign materials
+    materials = assign_materials(ct_data, mesh, config.output_dir, config)
+
+    # Export model
+    output_file = export_model(mesh, materials, config.output_dir, config)
+
+    elapsed_time = time.time() - start_time
+    logger.info(f"Pipeline completed in {elapsed_time:.1f} seconds")
+
+    return {
+        "ct_results": ct_results,
+        "mesh_info": material_info,
+        "output_file": output_file,
+    }
 
 
 def main(config: Optional[Config] = None) -> None:
@@ -396,5 +345,4 @@ def main(config: Optional[Config] = None) -> None:
         if not config:
             return
 
-    pipeline = Pipeline(config)
-    pipeline.run()
+    run_pipeline(config)

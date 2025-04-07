@@ -1,18 +1,16 @@
 # CT2FEA: CT to FEA Conversion Pipeline
 
-A high-performance tool for converting CT (Computed Tomography) data to Finite Element Analysis (FEA) models, with support for GPU acceleration.
+A streamlined tool for converting CT (Computed Tomography) data to Finite Element Analysis (FEA) models, designed for accessibility and ease of use.
 
 ## Features
 
 - Load and process CT image stacks (TIFF format)
-- Advanced denoising with multiple algorithms (Gaussian, NLM, TV)
-- Automatic bone and pore segmentation
-- High-quality hexahedral mesh generation
-- Multiple material models (linear elastic, plasticity, hyperelastic)
-- GPU acceleration support (CUDA and OpenCL)
-- Comprehensive mesh quality analysis
+- Basic denoising with Gaussian and NLM algorithms
+- Bone and pore segmentation
+- Hexahedral mesh generation
+- Linear elastic material model
 - Export to Abaqus INP format
-- Interactive visualization and reporting
+- Basic visualization for verification
 
 ## Installation
 
@@ -35,39 +33,68 @@ venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-4. (Optional) Install GPU dependencies:
-- For CUDA support: `pip install numba`
-- For OpenCL support: `pip install pyopencl`
-
 ## Usage
+
+CT2FEA provides multiple entry points to the pipeline, allowing you to start from different stages depending on your needs.
 
 ### GUI Mode
 
 Run the application in GUI mode:
 ```bash
-python -m ct2fea
+python -m ct2fea --gui
 ```
 
-### Command Line Mode
+### Full Pipeline
 
-Process a CT stack with default settings:
+Process a CT stack through the entire pipeline:
 ```bash
-python -m ct2fea --input /path/to/ct/stack --output /path/to/output
+python -m ct2fea pipeline --input /path/to/ct/stack --output /path/to/output
 ```
 
-Available options:
+### Individual Pipeline Stages
+
+CT2FEA allows you to run individual stages of the pipeline:
+
+#### 1. Process CT Data Only
+```bash
+python -m ct2fea process-ct --input /path/to/ct/stack --output /path/to/output
+```
+
+#### 2. Segment Pre-processed CT Data
+```bash
+python -m ct2fea segment --processed-ct /path/to/processed_ct.npy --output /path/to/output
+```
+
+#### 3. Generate Mesh from Segmentation Masks
+```bash
+python -m ct2fea generate-mesh --bone-mask /path/to/bone_mask.npy --pore-mask /path/to/pore_mask.npy --output /path/to/output
+```
+
+#### 4. Assign Materials to Existing Mesh
+```bash
+python -m ct2fea assign-materials --mesh /path/to/mesh.vtk --ct-data /path/to/processed_ct.npy --output /path/to/output
+```
+
+#### 5. Export to FEA Format
+```bash
+python -m ct2fea export --mesh /path/to/mesh.vtk --materials /path/to/materials.json --output /path/to/output
+```
+
+## Common Options
+
 - `--voxel-size`: Voxel size in micrometers (default: 10)
-- `--material-model`: Material model type (linear/plasticity/hyperelastic)
-- `--use-gpu`: Enable GPU acceleration
-- `--denoise-method`: Denoising algorithm (gaussian/nlm/tv)
+- `--denoise-method`: Denoising algorithm (gaussian/nlm)
 - `--coarsen-factor`: Volume coarsening factor
+- `--pore-threshold`: Threshold for pore segmentation (default: 0.2)
+- `--no-vis`: Disable visualization
+- `--config`: Path to JSON configuration file
 
 ## Configuration
 
 The application can be configured through:
-1. GUI interface
-2. Command-line arguments
-3. Configuration file (config.json)
+1. Command-line arguments
+2. Configuration file (JSON format)
+3. GUI interface
 
 Example configuration file:
 ```json
@@ -79,43 +106,45 @@ Example configuration file:
         "max_density": 2.0,
         "E_coeff": [10000, 2.0]
     },
-    "denoise_params": {
-        "method": "nlm",
-        "patch_size": 5
-    }
+    "denoise_method": "gaussian",
+    "pore_threshold": 0.2
 }
 ```
 
 ## Pipeline Steps
 
-1. **CT Data Loading**
+1. **CT Data Processing**
    - Support for TIFF stacks
-   - Automatic normalization and preprocessing
-
-2. **Image Processing**
-   - Multiple denoising options
+   - Normalization and optional denoising
    - Optional volume coarsening
-   - Automatic parameter estimation
 
-3. **Segmentation**
-   - Automatic bone/pore detection
+2. **Segmentation**
+   - Bone/pore detection
    - Morphological operations
    - Connected component analysis
 
-4. **Mesh Generation**
+3. **Mesh Generation**
    - Hexahedral element creation
    - Mesh quality checks
-   - Optional smoothing
 
-5. **Material Assignment**
-   - Multiple material models
-   - GPU-accelerated property calculation
-   - Automatic device selection
+4. **Material Assignment**
+   - Linear elastic material model
+   - Density-based property calculation
 
-6. **Export**
+5. **Export**
    - Abaqus INP format
-   - Quality reports
-   - Visualization outputs
+   - Basic visualization outputs
+
+## Visualization
+
+CT2FEA provides basic visualization capabilities to verify results at each stage:
+
+- CT slice visualization
+- Segmentation overlay visualization
+- 3D mesh visualization
+- Material property visualization
+
+All visualizations are saved as PNG images in the output directory.
 
 ## Development
 
@@ -130,7 +159,6 @@ Run specific test categories:
 ```bash
 pytest tests/test_processing.py
 pytest tests/test_meshing.py
-pytest -m "not gpu"  # Skip GPU tests
 ```
 
 ### Contributing
@@ -147,9 +175,10 @@ pytest -m "not gpu"  # Skip GPU tests
 - NumPy
 - SciPy
 - scikit-image
+- matplotlib
 - PyVista
 - meshio
-- CUDA/OpenCL (optional)
+- tifffile
 
 ## License
 
